@@ -10,7 +10,6 @@ from magi_attention.functional.flex_flash_attn import (
 
 from utils import RingComm, update_out_and_lse
 
-# from flash_attn.flash_attn_interface import _flash_attn_backward, _flash_attn_forward
 
 # 0-full 1-causal
 _ATTN_TYPE_TO_MASK: Dict[int, torch.Tensor] = {}
@@ -31,71 +30,49 @@ def _get_attn_type(
 
 # pylint: disable=too-many-locals
 def zigzag_flex_flash_attn_varlen_forward(
-    process_group,  # 分布式进程组
-    q: torch.Tensor,  # Query 张量
-    k: torch.Tensor,  # Key 张量
-    v: torch.Tensor,  # Value 张量
-    max_seqlen_q: int,  # Q 的最大序列长度
-    max_seqlen_k: int,  # K 的最大序列长度
-    sm_margin: int,  # softmax 的边际值
-    ranges_tensor: torch.Tensor,  # 完整的序列范围张量
-    q_ranges_tensor: torch.Tensor,  # Q 的序列范围张量
-    k_ranges_tensor: torch.Tensor,  # K 的序列范围张量
+    process_group,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    sm_margin: int,
+    ranges_tensor: torch.Tensor,
+    q_ranges_tensor: torch.Tensor,
+    k_ranges_tensor: torch.Tensor,
     *args,
     **kwargs,
 ):
-    """
-    ZigZag Flex Flash Attention 的前向传播函数，支持可变长度序列。
-    
-    实现了基于 Ring All-Reduce 的分布式注意力计算，采用 ZigZag 模式进行数据划分和计算。
-    每个 GPU 负责部分序列的计算，通过环形通信交换数据完成完整的注意力计算。
-    """
-    # 确保 k, v 是连续的内存布局
     k, v = k.contiguous(), v.contiguous()
-    # 创建用于通信的缓冲区
     k_buffer, v_buffer = torch.empty_like(k), torch.empty_like(v)
-    # 初始化环形通信器
     comm = RingComm(process_group)
 
-    # 初始化输出和 LSE (log-sum-exp，用于数值稳定性)
     out = None
     lse = None
     next_k, next_v = None, None
 
-    # 计算 attention scale factor
     softmax_scale = q.shape[-1] ** (-0.5)
-    softcap = 0.0  # softmax 上限值
+    softcap = 0.0
 
-    # 获取当前进程的 rank
-    comm = RingComm(process_group)
-    rank = comm.rank
+    max_seqlen = max_seqlen_q * 2  # zigzag head+tail
 
     def forward(
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        attn_type: int,  # 注意力类型：0 表示部分计算，1 表示完整计算
+        attn_type: int,
         q_ranges_tensor: torch.Tensor,
         k_ranges_tensor: torch.Tensor,
         max_seqlen_q: int,
         max_seqlen_k: int,
-    ):  
-        """
-        执行单步的 Flash Attention 计算
-        
-        参数:
-        - attn_type: 决定使用完整序列还是部分序列
-        - q/k_ranges_tensor: 定义序列的范围
-        - max_seqlen_q/k: 最大序列长度
-        """
-        # 根据 attn_type 获取注意力类型映射
+    ):
         attn_type_map = _get_attn_type(
             attn_type, q_ranges_tensor.shape[0], q_ranges_tensor.device
         )
-        
-        # 调用底层的 Flash Attention 实现
         out, softmax_lse = _flex_flash_attn_forward(
-            q, k, v,
+            q,
+            k,
+            v,
             q_ranges=q_ranges_tensor,
             k_ranges=k_ranges_tensor,
             max_seqlen_q=max_seqlen_q,
@@ -106,67 +83,66 @@ def zigzag_flex_flash_attn_varlen_forward(
             deterministic=False,
             sm_margin=sm_margin,
             return_dtype=None,
-            # 如果 Q 长度大于等于 K 长度，禁用原子规约
-            disable_fwd_atomic_reduction=max_seqlen_q >= max_seqlen_k,
+            disable_fwd_atomic_reduction=max_seqlen_q
+            >= max_seqlen_k,  # if False means we split q
         )
         return out, softmax_lse
 
-    # 执行 world_size 步的环形通信和计算
     for step in range(comm.world_size):
-        # 如果不是最后一步，执行通信
         if step + 1 != comm.world_size:
-            # 与下一个 rank 交换 k, v
             next_k = comm.send_recv(k, k_buffer)
             next_v = comm.send_recv(v, v_buffer)
             comm.commit()
 
-        # 第一步：计算本地完整的注意力
         if step == 0:
             block_out, block_lse = forward(
-                q, k, v,
-                attn_type=1,  # 完整计算
-                q_ranges_tensor=ranges_tensor,  # 使用完整范围
+                q,
+                k,
+                v,
+                attn_type=1,
+                q_ranges_tensor=ranges_tensor,
                 k_ranges_tensor=ranges_tensor,
-                max_seqlen_q=max_seqlen_q,
-                max_seqlen_k=max_seqlen_k,
+                max_seqlen_q=max_seqlen,
+                max_seqlen_k=max_seqlen,
             )
-            # 更新输出和 LSE
             out, lse = update_out_and_lse(out, lse, block_out, block_lse)
-            
-        # 当前 rank 大于等于 step：计算前半部分 Q 与完整 K
         elif step <= comm.rank:
             block_out, block_lse = forward(
-                q, k, v,
-                attn_type=0,  # 部分计算
-                q_ranges_tensor=ranges_tensor,  # 使用完整的 Q
-                k_ranges_tensor=k_ranges_tensor,  # 使用前半部分 K
-                max_seqlen_q=max_seqlen_q,
-                max_seqlen_k=max_seqlen_k // 2,  # K 只用一半长度
-            )
-            out, lse = update_out_and_lse(out, lse, block_out, block_lse)
-            
-        # 当前 rank 小于 step：计算后半部分 Q 与完整 K
-        else:
-            block_out, block_lse = forward(
-                q, k, v,
-                attn_type=0,  # 部分计算
-                q_ranges_tensor=q_ranges_tensor,  # 使用后半部分 Q
-                k_ranges_tensor=ranges_tensor,  # 使用完整的 K
-                max_seqlen_q=max_seqlen_q // 2,  # Q 只用一半长度
+                q,
+                k,
+                v,
+                attn_type=0,
+                q_ranges_tensor=ranges_tensor,  # use full q
+                k_ranges_tensor=k_ranges_tensor,  # use k of first half sequence
+                max_seqlen_q=max_seqlen,
                 max_seqlen_k=max_seqlen_k,
             )
             out, lse = update_out_and_lse(out, lse, block_out, block_lse)
+        else:
+            # 当前rank大于step时，只需要计算后面的Q
+            block_out, block_lse = forward(
+                q,
+                k,
+                v,
+                attn_type=0,
+                q_ranges_tensor=q_ranges_tensor,  # use q of second half sequence
+                k_ranges_tensor=ranges_tensor,  # use full k
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_k=max_seqlen,
+            )
+            out, lse = update_out_and_lse(
+                out,
+                lse,
+                block_out,
+                block_lse,
+            )
 
-        # 如果不是最后一步，等待通信完成并更新 k, v
         if step + 1 != comm.world_size:
-            comm.wait()  # 等待通信完成
-            # 交换缓冲区
+            comm.wait()
             k_buffer, v_buffer = k, v
             k, v = next_k, next_v
-            
-    # 转换输出格式
-    out = out.to(q.dtype)  # 确保输出类型与输入一致
-    lse = lse.squeeze(dim=-1).transpose(0, 1)  # 调整 LSE 的维度
+    out = out.to(q.dtype)
+    lse = lse.squeeze(dim=-1).transpose(0, 1)
     return out, lse
 
 
@@ -200,6 +176,8 @@ def zigzag_flex_flash_attn_varlen_backward(
 
     softmax_scale = q.shape[-1] ** (-0.5)
     softcap = 0.0
+
+    max_seqlen = max_seqlen_q * 2  # zigzag head+tail
 
     def backward(
         dout: torch.Tensor,
@@ -254,8 +232,8 @@ def zigzag_flex_flash_attn_varlen_backward(
                 attn_type=1,
                 q_ranges_tensor=ranges_tensor,  # use full q
                 k_ranges_tensor=ranges_tensor,  # use full k
-                max_seqlen_q=max_seqlen_q,
-                max_seqlen_k=max_seqlen_k,
+                max_seqlen_q=max_seqlen,
+                max_seqlen_k=max_seqlen,
             )
             dq = dq.to(torch.float32)
             dk = dk.to(torch.float32)
@@ -272,8 +250,8 @@ def zigzag_flex_flash_attn_varlen_backward(
                     attn_type=0,
                     q_ranges_tensor=ranges_tensor,  # use full q
                     k_ranges_tensor=k_ranges_tensor,  # use k of first half sequence
-                    max_seqlen_q=max_seqlen_q,
-                    max_seqlen_k=max_seqlen_k // 2,  # only half k
+                    max_seqlen_q=max_seqlen,
+                    max_seqlen_k=max_seqlen_k,
                 )
             else:
                 _dq, _dk, _dv = backward(
@@ -286,8 +264,8 @@ def zigzag_flex_flash_attn_varlen_backward(
                     attn_type=0,
                     q_ranges_tensor=q_ranges_tensor,
                     k_ranges_tensor=ranges_tensor,  # use full k
-                    max_seqlen_q=max_seqlen_q // 2,  # only half q
-                    max_seqlen_k=max_seqlen_k,
+                    max_seqlen_q=max_seqlen_q,
+                    max_seqlen_k=max_seqlen,
                 )
 
             dq += _dq
@@ -315,6 +293,7 @@ def zigzag_flex_flash_attn_varlen_backward(
     )
 
     return dqkv
+
 
 class ZigZagFlexFlashAttnVarlenFunc(torch.autograd.Function):
     """
@@ -391,7 +370,7 @@ class ZigZagFlexFlashAttnVarlenFunc(torch.autograd.Function):
 
         # 调用您实现的核心反向传播逻辑
         # **重要**: 假设 backward 函数返回 (dq, dk, dv) 元组
-        dq, dk, dv = zigzag_flex_flash_attn_varlen_backward(
+        dqkv = zigzag_flex_flash_attn_varlen_backward(
             ctx.process_group,
             ctx.dgrad_process_group,
             dout,
@@ -410,20 +389,7 @@ class ZigZagFlexFlashAttnVarlenFunc(torch.autograd.Function):
 
         # 返回的梯度必须与 forward 的输入参数一一对应
         # 对于不需要梯度的输入（如配置参数、进程组），返回 None
-        return (
-            dq,                      # q 的梯度
-            dk,                      # k 的梯度
-            dv,                      # v 的梯度
-            None,                    # max_seqlen_q 的梯度
-            None,                    # max_seqlen_k 的梯度
-            None,                    # sm_margin 的梯度
-            None,                    # ranges_tensor 的梯度
-            None,                    # q_ranges_tensor 的梯度
-            None,                    # k_ranges_tensor 的梯度
-            None,                    # process_group 的梯度
-            None,                    # dgrad_process_group 的梯度
-            None,                    # return_softmax 的梯度
-        )
+        return dqkv
 
 # --- 用户友好的 apply 函数 ---
 

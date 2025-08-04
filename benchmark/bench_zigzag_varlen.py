@@ -1,100 +1,176 @@
 import os
-
 import torch
 import torch.distributed as dist
+from typing import List, Tuple, Dict
+import numpy as np
+from datetime import datetime
+import math
 
-# --- Imports (assuming they are correct) ---
-from zigzag_flex_flash_attn import zigzag_flex_flash_attn_varlen_func
 from magi_attention.common.ranges import AttnRanges
+from magi_attention.common.enum import AttnMaskType
+from magi_attention.meta._calc_dispatch_meta import _calc_self_attn_areas
 from magi_attention.functional.dist_attn import dist_attn_func
 from magi_attention.dist_attn_runtime_mgr import init_dist_attn_runtime_mgr
 from magi_attention.config import DistAttnConfig
-from magi_attention.common.enum import AttnMaskType
-from magi_attention.benchmarking import do_bench
 
-# --- FLOPs calculator (assuming it's available) ---
-try:
-    from tools.calculate_flops import calculate_attn_flops
-except ImportError:
-    from magi_attention.meta._calc_dispatch_meta import _calc_self_attn_areas
-    def calculate_attn_flops(
-        q_ranges: AttnRanges, k_ranges: AttnRanges, attn_mask_type: list[AttnMaskType],
-        total_seqlen_q: int, num_heads_q: int, head_dim: int,
-    ) -> dict[str, float]:
-        attn_area = _calc_self_attn_areas(
-            q_ranges, k_ranges, attn_mask_type,
-            num_chunks=1, chunk_size=total_seqlen_q,
-        ).area
-        flops_fwd = 4 * attn_area * num_heads_q * head_dim
-        flops_bwd = flops_fwd * 2.5
-        flops_1f1b = flops_fwd + flops_bwd
-        return {"fwd": flops_fwd, "bwd": flops_bwd, "1f1b": flops_1f1b}
+from zigzag_flex_flash_attn import zigzag_flex_flash_attn_varlen_func
+from ring_flash_attn import zigzag_ring_flash_attn_varlen_func
 
+def calculate_attn_flops(
+    q_ranges: AttnRanges,
+    k_ranges: AttnRanges,
+    attn_mask_type: List[AttnMaskType],
+    total_seqlen_q: int,
+    num_heads_q: int,
+    num_heads_kv: int,
+    head_dim: int,
+) -> Dict[str, float]:
+    """计算注意力机制的理论 FLOPs
+    
+    对于因果注意力，每个位置 i 只能看到位置 0 到 i，所以：
+    - 位置 0 看到 1 个 token
+    - 位置 1 看到 2 个 tokens
+    - 位置 2 看到 3 个 tokens
+    ...
+    - 位置 n-1 看到 n 个 tokens
+    总计算量是等差数列求和：n*(n+1)/2
+    """
+    # 计算每个序列的实际注意力计算量
+    total_tokens = 0
+    total_attn_elements = 0
+    
+    for i in range(len(q_ranges)):
+        q_start, q_end = q_ranges[i].start, q_ranges[i].end
+        k_start, k_end = k_ranges[i].start, k_ranges[i].end
+        seq_len = q_end - q_start
+        
+        if attn_mask_type[i] == AttnMaskType.CAUSAL:
+            # 因果注意力：等差数列求和 n*(n+1)/2
+            attn_elements = (seq_len * (seq_len + 1)) // 2
+        else:
+            # 全量注意力：n*n
+            attn_elements = seq_len * seq_len
+            
+        total_tokens += seq_len
+        total_attn_elements += attn_elements
+    
+    # 计算 GQA 的实际 FLOPs
+    # 1. QK 乘法：每个 token 位置都需要计算 head_dim 维度的点积
+    qk_flops = 2 * total_attn_elements * head_dim  # 乘加各算一次
+    
+    # 2. Softmax: exp + sum + div，每个注意力分数都需要
+    softmax_flops = 3 * total_attn_elements
+    
+    # 3. PV 乘法：每个注意力分数都要乘以对应的 V 向量
+    pv_flops = 2 * total_attn_elements * head_dim
+    
+    # 考虑 GQA：每个 KV head 被 num_heads_q/num_heads_kv 个 Q head 使用
+    heads_ratio = num_heads_q / num_heads_kv
+    flops_per_kv_head = qk_flops + softmax_flops + pv_flops
+    
+    # 总 FLOPs = 每个 KV head 的 FLOPs * KV head 数量 * 每个 KV head 服务的 Q head 数量
+    flops_fwd = flops_per_kv_head * num_heads_kv
+    
+    # 反向传播约为前向传播的 2 倍
+    # - QK 反向：计算 Q 和 K 的梯度
+    # - Softmax 反向：计算 softmax 的梯度
+    # - PV 反向：计算 P 和 V 的梯度
+    flops_bwd = flops_fwd * 2
+    flops_1f1b = flops_fwd + flops_bwd
+    
+    return {
+        "fwd": flops_fwd,
+        "bwd": flops_bwd,
+        "1f1b": flops_1f1b,
+        "details": {
+            "total_tokens": total_tokens,
+            "total_attn_elements": total_attn_elements,
+            "qk_flops": qk_flops * num_heads_kv,
+            "softmax_flops": softmax_flops * num_heads_kv,
+            "pv_flops": pv_flops * num_heads_kv,
+            "flops_per_kv_head": flops_per_kv_head
+        }
+    }
 
 def calculate_global_causal_varlen_flops(
     world_size: int,
     batch_size: int,
     seqlen: int,
     num_heads: int,
+    num_kv_heads: int,
     head_dim: int,
     forward_only: bool,
-) -> float:
-    """
-    Calculates the total theoretical FLOPs for a distributed causal varlen attention task.
-
-    This function models the entire problem as a single, large causal attention
-    computation spread across all GPUs. The resulting FLOPs value is the
-    theoretical total for the entire system, and is applicable to any algorithm
-    (like Magi or Zigzag) that correctly solves this problem.
-
-    Args:
-        world_size: The number of GPUs in the process group.
-        batch_size: The number of sequences on EACH GPU.
-        seqlen: The length of each sequence.
-        num_heads: The number of attention heads.
-        head_dim: The dimension of each attention head.
-        forward_only: If True, calculates forward pass FLOPs. Otherwise, fwd + bwd.
-
-    Returns:
-        The total theoretical FLOPs for the distributed computation.
-    """
-    # 1. Define the sequence layout for a SINGLE rank.
-    # This assumes uniform sequence lengths for simplicity, matching the benchmark.
-    # ... (steps 1 and 2, building the global lists, are all correct and remain unchanged) ...
+) -> Dict[str, float]:
+    """计算分布式因果可变长度注意力的理论 FLOPs"""
+    # 构建全局序列布局
     local_cu_seqlens = torch.arange(0, (batch_size + 1) * seqlen, seqlen, dtype=torch.int32)
     global_q_ranges_list = []
     global_k_ranges_list = []
-    total_tokens = 0
+    
     for rank in range(world_size):
         rank_offset = rank * batch_size * seqlen
         for i in range(batch_size):
             seq_start = rank_offset + local_cu_seqlens[i].item()
             seq_end = rank_offset + local_cu_seqlens[i+1].item()
             global_q_ranges_list.append([seq_start, seq_end])
-            global_k_ranges_list.append([0, seq_end]) # Causality is defined here
-        total_tokens += batch_size * seqlen
+            # 因果掩码：只能看到当前及之前的 tokens
+            global_k_ranges_list.append([0, seq_end])
 
     global_q_ranges = AttnRanges.from_ranges(global_q_ranges_list)
     global_k_ranges = AttnRanges.from_ranges(global_k_ranges_list)
     global_batch_size = world_size * batch_size
 
-    # 3. Use the precise calculator with the CORRECT mask type.
-    # We tell the calculator that each sub-problem is a full, dense computation.
+    # 使用因果掩码计算 FLOPs
     flops_dict = calculate_attn_flops(
         q_ranges=global_q_ranges,
         k_ranges=global_k_ranges,
-        # *** THE FIX IS HERE ***
-        attn_mask_type=[AttnMaskType.FULL] * global_batch_size,
-        total_seqlen_q=total_tokens,
+        attn_mask_type=[AttnMaskType.CAUSAL] * global_batch_size,
+        total_seqlen_q=seqlen * batch_size * world_size,
         num_heads_q=num_heads,
+        num_heads_kv=num_kv_heads,
         head_dim=head_dim,
     )
+    
+    # if rank == 0:
+    #     details = flops_dict["details"]
+    #     print(f"\nComputation Analysis:")
+    #     print(f"Total tokens: {details['total_tokens']}")
+    #     print(f"Total attention elements: {details['total_attn_elements']}")
+    #     print(f"FLOPs per KV head: {details['flops_per_kv_head']/1e9:.2f} GFLOPs")
+    #     print(f"\nFLOPs Breakdown (per iteration):")
+    #     print(f"QK multiply: {details['qk_flops']/1e12:.2f} TFLOPs")
+    #     print(f"Softmax: {details['softmax_flops']/1e12:.2f} TFLOPs")
+    #     print(f"PV multiply: {details['pv_flops']/1e12:.2f} TFLOPs")
+    #     print(f"Total forward: {flops_dict['fwd']/1e12:.2f} TFLOPs")
+    #     if not forward_only:
+    #         print(f"Total backward: {flops_dict['bwd']/1e12:.2f} TFLOPs")
+    
+    return flops_dict
 
-    # 4. Return the final FLOPs count (unchanged).
-    total_flops = flops_dict["fwd"] if forward_only else flops_dict["1f1b"]
-    return total_flops
-
-
+class BenchmarkMetrics:
+    """性能指标收集器"""
+    def __init__(self):
+        self.times = []  # 每次迭代的时间
+        self.start_memory = 0  # 开始时的显存使用
+        self.peak_memory = 0   # 峰值显存使用
+        
+    def update_memory(self):
+        current_memory = torch.cuda.memory_allocated()
+        self.peak_memory = max(self.peak_memory, current_memory)
+        
+    def add_time(self, time_ms):
+        self.times.append(time_ms)
+        
+    def get_stats(self) -> Dict[str, float]:
+        times = np.array(self.times)
+        return {
+            "mean_time": np.mean(times),
+            "std_time": np.std(times),
+            "min_time": np.min(times),
+            "max_time": np.max(times),
+            "memory_used": (self.peak_memory - self.start_memory) / 1024**2,  # MB
+            "peak_memory": self.peak_memory / 1024**2  # MB
+        }
 
 def full_attention_to_varlen_attention(batch_size: int, seqlen: int):
     cu_seqlens = torch.arange(
@@ -102,200 +178,6 @@ def full_attention_to_varlen_attention(batch_size: int, seqlen: int):
         dtype=torch.int32, device=torch.cuda.current_device(),
     )
     return cu_seqlens, cu_seqlens
-
-### MODIFICATION START 1 ###
-# Modify the function to return the global metadata we need.
-# def create_magi_runtime_with_mgr_causal_varlen(
-#     cu_seqlens: torch.Tensor,
-#     cp_group: dist.ProcessGroup,
-#     chunk_size: int = 1024,
-# ) -> Tuple[DistAttnRuntimeMgr, AttnRanges, AttnRanges, int]:
-#     """
-#     Creates a MagiAttention runtime manager and also returns the global
-#     attention metadata needed for FLOPs calculation.
-#     """
-#     # 1. Calculate global information
-#     total_seqlen = cu_seqlens[-1].item()
-#     num_seqs = len(cu_seqlens) - 1
-
-#     # 2. Construct GLOBAL q_ranges and k_ranges
-#     q_ranges_list = [[cu_seqlens[i].item(), cu_seqlens[i+1].item()] for i in range(num_seqs)]
-#     global_q_ranges = AttnRanges.from_ranges(q_ranges_list)
-
-#     k_ranges_list = [[0, cu_seqlens[i+1].item()] for i in range(num_seqs)]
-#     global_k_ranges = AttnRanges.from_ranges(k_ranges_list)
-
-#     # 3. Call the core initialization function
-#     dist_attn_runtime_mgr = init_dist_attn_runtime_mgr(
-#         q_ranges=global_q_ranges,
-#         k_ranges=global_k_ranges,
-#         attn_mask_type=AttnMaskType.CAUSAL,
-#         total_seqlen_q=total_seqlen,
-#         total_seqlen_k=total_seqlen,
-#         chunk_size=chunk_size,
-#         cp_group=cp_group,
-#         is_same_source=True,
-#         is_q_permutable=True,
-#         is_k_permutable=True,
-#         dist_attn_config=DistAttnConfig(),
-#     )
-
-#     # 4. Return the manager AND the global metadata
-#     return dist_attn_runtime_mgr, global_q_ranges, global_k_ranges, total_seqlen
-# ### MODIFICATION END 1 ###
-
-
-# def benchmark_attention(
-#     attn_type: str,
-#     local_total_tokens: int,
-#     batch_size: int,
-#     num_heads: int,
-#     num_kv_heads: int,
-#     head_dim: int,
-#     num_iter: int,
-#     forward_only: bool,
-#     cp_groups: List[dist.ProcessGroup],
-# ):
-#     dtype = torch.bfloat16
-#     rank = dist.get_rank()
-#     world_size = dist.get_world_size()
-#     device = torch.device(f"cuda:{rank}")
-#     torch.cuda.set_device(device)
-
-#     # seqlen = local_total_tokens // batch_size
-#     # cu_seqlens, _ = full_attention_to_varlen_attention(batch_size, seqlen)
-
-#     seqlen = local_total_tokens // batch_size
-    
-#     # --- 正确的全局元数据构建 ---
-
-#     # 1. 定义本地的序列布局 (这和之前一样)
-#     local_cu_seqlens, _ = full_attention_to_varlen_attention(batch_size, seqlen)
-#     num_local_seqs = len(local_cu_seqlens) - 1
-
-#     # 2. 构建跨所有 rank 的全局 q_ranges 和 k_ranges
-#     global_q_ranges_list = []
-#     global_k_ranges_list = []
-
-#     for r in range(world_size):
-#         # 计算 rank 'r' 的 token 偏移量
-#         rank_offset = r * local_total_tokens
-#         for i in range(num_local_seqs):
-#             # 计算每个序列在全局范围内的起始和结束位置
-#             global_seq_start = rank_offset + local_cu_seqlens[i].item()
-#             global_seq_end = rank_offset + local_cu_seqlens[i+1].item()
-            
-#             # 全局 Q 的范围就是序列自身的位置
-#             global_q_ranges_list.append([global_seq_start, global_seq_end])
-            
-#             # 对于因果注意力，全局 K 的范围是从最开始 (token 0) 
-#             # 一直到当前序列的结束位置
-#             global_k_ranges_list.append([0, global_seq_end])
-
-#     global_q_ranges = AttnRanges.from_ranges(global_q_ranges_list)
-#     global_k_ranges = AttnRanges.from_ranges(global_k_ranges_list)
-    
-#     # 3. 计算真正的全局总序列长度
-#     global_total_seqlen = world_size * local_total_tokens
-#     global_num_seqs = world_size * num_local_seqs
-
-#     # if rank == 0:
-#     #     print(f"global_total_seqlen: {global_total_seqlen}")
-#     #     print(f"global_num_seqs: {global_num_seqs}")
-
-
-#     q = torch.randn(local_total_tokens, num_heads, head_dim, device=device, dtype=dtype, requires_grad=not forward_only)
-#     k = torch.randn(local_total_tokens, num_kv_heads, head_dim, device=device, dtype=dtype, requires_grad=not forward_only)
-#     v = torch.randn(local_total_tokens, num_kv_heads, head_dim, device=device, dtype=dtype, requires_grad=not forward_only)
-    
-#     if attn_type == "magi":
-#         # runtime_mgr, global_q_ranges, global_k_ranges, total_seqlen = create_magi_runtime_with_mgr_causal_varlen(
-#         #     cu_seqlens, cp_groups[0]
-#         # )
-#         # runtime = runtime_mgr.dist_attn_runtime
-
-#         runtime_mgr = init_dist_attn_runtime_mgr(
-#             q_ranges=global_q_ranges,
-#             k_ranges=global_k_ranges,
-#             attn_mask_type=AttnMaskType.CAUSAL,
-#             total_seqlen_q=global_total_seqlen,
-#             total_seqlen_k=global_total_seqlen,
-#             chunk_size=1024,
-#             cp_group=cp_groups[0],
-#             is_same_source=True,
-#             is_q_permutable=True,
-#             is_k_permutable=True,
-#             dist_attn_config=DistAttnConfig(),
-#         )
-#         runtime = runtime_mgr.dist_attn_runtime
-#     elif attn_type == "zigzag":
-#         ranges_tensor = torch.stack([local_cu_seqlens[:-1], local_cu_seqlens[1:]], dim=1).to(device)
-#         q_ranges_tensor = ranges_tensor
-#         k_ranges_tensor = ranges_tensor
-#         max_seqlen_q = max_seqlen_k = seqlen
-#         sm_margin = 0
-#     else:
-#         raise ValueError(f"Unknown attention type: {attn_type}")
-
-#     # --- Warmup ---
-#     # (Warmup code is correct and unchanged)
-#     for _ in range(10):
-#         if attn_type == "magi":
-#             _, _ = dist_attn_func(q, k, v, runtime)
-#         else:
-#             _ = zigzag_flex_flash_attn_varlen_func(
-#                 q, k, v, max_seqlen_q, max_seqlen_k, sm_margin,
-#                 ranges_tensor, q_ranges_tensor, k_ranges_tensor,
-#                 process_group=cp_groups[0], dgrad_process_group=cp_groups[1]
-#             )
-
-#     # 确保所有 GPU 同步开始
-#     torch.cuda.synchronize()
-#     dist.barrier()
-
-#     # --- 使用 CUDA events 进行计时 ---
-#     # 创建 CUDA events
-#     start_event = torch.cuda.Event(enable_timing=True)
-#     start_event.record()
-
-#     for i in range(num_iter):
-#         if attn_type == "magi":
-#             _, _ = dist_attn_func(q, k, v, runtime)
-#         else:
-#             _ = zigzag_flex_flash_attn_varlen_func(
-#                 q, k, v, max_seqlen_q, max_seqlen_k, sm_margin,
-#                 ranges_tensor, q_ranges_tensor, k_ranges_tensor,
-#                 process_group=cp_groups[0], dgrad_process_group=cp_groups[1]
-#             )
-
-#     end_event = torch.cuda.Event(enable_timing=True)
-#     end_event.record()
-#     torch.cuda.synchronize()
-#     dist.barrier()
-#     total_time = start_event.elapsed_time(end_event) / 1000.0
-
-#     # 计算性能指标
-#     if attn_type == "magi":
-#         flops_dict = calculate_attn_flops(
-#             q_ranges=global_q_ranges,
-#             k_ranges=global_k_ranges,
-#             attn_mask_type=[AttnMaskType.CAUSAL] * global_num_seqs,
-#             total_seqlen_q=global_total_seqlen,
-#             num_heads_q=num_heads,
-#             head_dim=head_dim,
-#         )
-#         total_flops = flops_dict["fwd"] if forward_only else flops_dict["1f1b"]
-#         tflops = total_flops / total_time / 1e12
-#     else:
-#         total_flops = calculate_global_causal_varlen_flops(
-#             world_size, batch_size, seqlen, num_heads, head_dim, forward_only
-#         ) 
-#         tflops = total_flops / total_time / 1e12
-
-#     sec_per_iter = total_time / num_iter
-
-#     if rank == 0:
-#         print(f"| {attn_type:<10} | {'Causal Varlen':<14} | {world_size:<4} | {local_total_tokens:<12} | {sec_per_iter:<10.4f} | {tflops:<10.2f} |")
 
 def dist_do_bench(fn, warmup=25, rep=100, grad_to_none=None):
     """
@@ -445,23 +327,38 @@ def benchmark_attention(
     num_heads: int,
     num_kv_heads: int,
     head_dim: int,
-    num_iter: int, # num_iter 现在可以被 do_bench 的 rep 参数替代
+    num_iter: int,
     forward_only: bool,
-    cp_groups: list[dist.ProcessGroup],
+    cp_groups: List[dist.ProcessGroup],
 ):
+    """运行基准测试
+    
+    Args:
+        attn_type: "magi", "zigzag_flex", 或 "zigzag_ring"
+        local_total_tokens: 每个 GPU 的 token 数量
+        batch_size: 批次大小
+        num_heads: 注意力头数
+        num_kv_heads: KV 头数
+        head_dim: 注意力头维度
+        num_iter: 迭代次数
+        forward_only: 是否只测试前向传播
+        cp_groups: 通信组列表
+    """
     dtype = torch.bfloat16
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     device = torch.device(f"cuda:{rank}")
     torch.cuda.set_device(device)
 
+    # 计算序列长度和创建输入张量
     seqlen = local_total_tokens // batch_size
-    
-    # --- 全局元数据构建 (这部分代码保持不变) ---
     local_cu_seqlens, _ = full_attention_to_varlen_attention(batch_size, seqlen)
+    
+    # --- 构建全局元数据 ---
     num_local_seqs = len(local_cu_seqlens) - 1
     global_q_ranges_list = []
     global_k_ranges_list = []
+    
     for r in range(world_size):
         rank_offset = r * local_total_tokens
         for i in range(num_local_seqs):
@@ -469,18 +366,38 @@ def benchmark_attention(
             global_seq_end = rank_offset + local_cu_seqlens[i+1].item()
             global_q_ranges_list.append([global_seq_start, global_seq_end])
             global_k_ranges_list.append([0, global_seq_end])
+    
     global_q_ranges = AttnRanges.from_ranges(global_q_ranges_list)
     global_k_ranges = AttnRanges.from_ranges(global_k_ranges_list)
     global_total_seqlen = world_size * local_total_tokens
-    global_num_seqs = world_size * num_local_seqs
-
-    # --- 输入张量 (保持不变) ---
-    q = torch.randn(local_total_tokens, num_heads, head_dim, device=device, dtype=dtype, requires_grad=not forward_only)
-    k = torch.randn(local_total_tokens, num_kv_heads, head_dim, device=device, dtype=dtype, requires_grad=not forward_only)
-    v = torch.randn(local_total_tokens, num_kv_heads, head_dim, device=device, dtype=dtype, requires_grad=not forward_only)
     
-    # --- 运行时和参数准备 (保持不变) ---
-    runtime = None
+    # 创建标准格式的输入张量
+    q = torch.randn(
+        batch_size, seqlen, num_heads, head_dim,
+        device=device, dtype=dtype,
+        requires_grad=not forward_only
+    )
+    k = torch.randn(
+        batch_size, seqlen, num_kv_heads, head_dim,
+        device=device, dtype=dtype,
+        requires_grad=not forward_only
+    )
+    v = torch.randn(
+        batch_size, seqlen, num_kv_heads, head_dim,
+        device=device, dtype=dtype,
+        requires_grad=not forward_only
+    )
+    
+    # 转换为 varlen 格式
+    q = q.reshape(-1, num_heads, head_dim)
+    k = k.reshape(-1, num_kv_heads, head_dim)
+    v = v.reshape(-1, num_kv_heads, head_dim)
+
+    # 初始化性能指标收集器
+    metrics = BenchmarkMetrics()
+    metrics.start_memory = torch.cuda.memory_allocated()
+
+    # 准备运行时配置
     if attn_type == "magi":
         runtime_mgr = init_dist_attn_runtime_mgr(
             q_ranges=global_q_ranges,
@@ -496,109 +413,160 @@ def benchmark_attention(
             dist_attn_config=DistAttnConfig(),
         )
         runtime = runtime_mgr.dist_attn_runtime
-    elif attn_type == "zigzag":
+    elif attn_type == "zigzag_flex":
         ranges_tensor = torch.stack([local_cu_seqlens[:-1], local_cu_seqlens[1:]], dim=1).to(device)
-        q_ranges_tensor = ranges_tensor
-        k_ranges_tensor = ranges_tensor
+        q_ranges_tensor = k_ranges_tensor = ranges_tensor
         max_seqlen_q = max_seqlen_k = seqlen
         sm_margin = 0
+    elif attn_type == "zigzag_ring":
+        softmax_scale = 1.0 / math.sqrt(head_dim)
     else:
         raise ValueError(f"Unknown attention type: {attn_type}")
 
-    # --- 定义要被 do_bench 测量的函数 ---
-    # 这是关键的封装步骤
-    def get_bench_fn():
+    # 预热
+    warmup_iters = 10
+    for _ in range(warmup_iters):
         if attn_type == "magi":
-            def magi_fn():
-                # 在函数内部调用，并加上 barrier
-                _, _ = dist_attn_func(q, k, v, runtime)
-                dist.barrier() # 必须！确保所有 rank 都完成了
-            return magi_fn
-        else: # zigzag
-            def zigzag_fn():
-                # 在函数内部调用，并加上 barrier
-                _ = zigzag_flex_flash_attn_varlen_func(
-                    q, k, v, max_seqlen_q, max_seqlen_k, sm_margin,
-                    ranges_tensor, q_ranges_tensor, k_ranges_tensor,
-                    process_group=cp_groups[0], dgrad_process_group=cp_groups[1]
-                )
-                dist.barrier() # 必须！确保所有 rank 都完成了
-            return zigzag_fn
+            _, _ = dist_attn_func(q, k, v, runtime)
+        elif attn_type == "zigzag_flex":
+            _ = zigzag_flex_flash_attn_varlen_func(
+                q, k, v, max_seqlen_q, max_seqlen_k, sm_margin,
+                ranges_tensor, q_ranges_tensor, k_ranges_tensor,
+                process_group=cp_groups[0], dgrad_process_group=cp_groups[1]
+            )
+        else:  # zigzag_ring
+            _ = zigzag_ring_flash_attn_varlen_func(
+                q, k, v, local_cu_seqlens, seqlen,
+                dropout_p=0.0,
+                softmax_scale=softmax_scale,
+                causal=True,
+                window_size=(-1, -1),
+                group=cp_groups[0]
+            )
 
-    bench_fn = get_bench_fn()
+    # 确保预热完成
+    torch.cuda.synchronize()
+    dist.barrier()
 
-    # --- 使用 do_bench 进行基准测试 ---
-    # warmup 和 rep 的单位是 ms，可以根据需要调整
-    # 我们使用 return_mode='median' 来获得更稳定的结果
-    # `rep` 控制了测量的总时间，可以替代原来的 `num_iter`
-    
-    # 确保所有 rank 都准备好了再开始 benchmark
+    # 主要测试循环
+    for i in range(num_iter):
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        
+        start_event.record()
+        
+        if attn_type == "magi":
+            _, _ = dist_attn_func(q, k, v, runtime)
+        elif attn_type == "zigzag_flex":
+            _ = zigzag_flex_flash_attn_varlen_func(
+                q, k, v, max_seqlen_q, max_seqlen_k, sm_margin,
+                ranges_tensor, q_ranges_tensor, k_ranges_tensor,
+                process_group=cp_groups[0], dgrad_process_group=cp_groups[1]
+            )
+        else:  # zigzag_ring
+            _ = zigzag_ring_flash_attn_varlen_func(
+                q, k, v, local_cu_seqlens, seqlen,
+                dropout_p=0.0,
+                softmax_scale=softmax_scale,
+                causal=True,
+                window_size=(-1, -1),
+                group=cp_groups[0]
+            )
+            
+        end_event.record()
+        torch.cuda.synchronize()
+        metrics.add_time(start_event.elapsed_time(end_event))
+        metrics.update_memory()
+
     dist.barrier()
     
-    # 调用 do_bench
-    # 注意：do_bench 内部有自己的 warmup，所以外部的 warmup 循环可以移除
-    sec_per_iter = dist_do_bench(
-        bench_fn, 
-        warmup=10, 
-        rep=num_iter
-    ) / 1000.0
-    
-
-
-    # total_flops = calculate_global_causal_varlen_flops(
-    #     world_size, batch_size, seqlen, num_heads, head_dim, forward_only
-    # )
-
-    total_flops = calculate_global_causal_varlen_flops(
-        world_size, batch_size, seqlen, num_heads, head_dim, forward_only
+    # 计算性能指标
+    stats = metrics.get_stats()
+    flops_dict = calculate_global_causal_varlen_flops(
+        world_size, batch_size, seqlen,
+        num_heads, num_kv_heads, head_dim, forward_only
     )
-   
-    # TFLOPs = (Total FLOPs / sec_per_iter) / 1e12
-    tflops = (total_flops /  world_size) / sec_per_iter / 1e12
+    
+    total_flops = flops_dict["fwd"] if forward_only else flops_dict["1f1b"]
+    tflops = total_flops / (stats["mean_time"] / 1000.0) / 1e12  # 转换为 TFLOPs
 
     if rank == 0:
-        print(f"| {attn_type:<10} | {'Causal Varlen':<14} | {world_size:<4} | {local_total_tokens:<12} | {sec_per_iter:<10.4f} | {tflops:<10.2f} |")
+        print(
+            f"| {attn_type:<12} | {'Causal Varlen':<14} | {world_size:<4} | "
+            f"{local_total_tokens:<12} | {stats['mean_time']/1000:<10.4f} | "
+            f"{tflops:<10.2f} | {stats['memory_used']:<8.1f} | "
+            f"{stats['std_time']/1000:<8.4f} |"
+        )
 
-    # 清理，防止内存泄漏
-    del q, k, v, runtime
-    torch.cuda.empty_cache()
-    dist.barrier()
-
-
-if __name__ == "__main__":
-    # --- Distributed setup ---
-    LOCAL_RANK = int(os.environ["LOCAL_RANK"])
-    device = torch.device(f"cuda:{LOCAL_RANK}")
-    torch.cuda.set_device(device)
-    dist.init_process_group(backend="nccl", device_id=device)
-    rank = dist.get_rank()
-    world_size = dist.get_world_size()
-
-    cp_group_kv = dist.new_group(ranks=list(range(world_size)))
-    cp_group_dkv = dist.new_group(ranks=list(range(world_size)))
-    cp_groups = [cp_group_kv, cp_group_dkv]
-
-    # --- Benchmark parameters ---
-    local_total_tokens = [8192, 16384, 32768, 65536, 131072]
+def main():
+    # 设置基准测试参数
+    local_total_tokens_list = [8192, 16384, 32768, 65536]
     batch_size = 4
     num_heads = 32
-    num_kv_heads = 32 
+    num_kv_heads = 8
     head_dim = 128
     num_iter = 50
     forward_only = True
 
+    # 初始化分布式环境
+    try:
+        local_rank = int(os.environ["LOCAL_RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+        dist.init_process_group("nccl")
+        rank = dist.get_rank()
+    except KeyError:
+        # 单进程模式
+        local_rank = 0
+        world_size = 1
+        rank = 0
+        # 创建一个假的进程组
+        dist.init_process_group(
+            backend="nccl",
+            init_method="tcp://127.0.0.1:29500",
+            world_size=1,
+            rank=0
+        )
+
+    # 设置设备
+    device = torch.device(f"cuda:{local_rank}")
+    torch.cuda.set_device(device)
+
+    # 创建通信组
+    cp_groups = [dist.group.WORLD, dist.group.WORLD]
+
     if rank == 0:
-        print(f"--- Comparing CAUSAL VARLEN Attention on {world_size} GPUs ---")
-        print(f"Local Tokens: {local_total_tokens}, Total Tokens: {local_total_tokens * world_size}")
-        print("-------------------------------------------------------------------------------------")
-        print("| Type       | Mode           | CP   | Local Tokens | Time(s)    | TFLOPs     |")
-        print("|------------|----------------|------|--------------|------------|------------|")
+        print(f"\n=== Benchmark Started at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===")
+        print(f"GPU: {torch.cuda.get_device_name()}")
+        print(f"CUDA: {torch.version.cuda}")
+        print(f"PyTorch: {torch.__version__}")
+        print(f"\nConfiguration:")
+        print(f"- Batch Size: {batch_size}")
+        print(f"- Num Heads: {num_heads}")
+        print(f"- Head Dim: {head_dim}")
+        print(f"- Forward Only: {forward_only}")
+        print(f"\n--- Running {'Multi-GPU' if world_size > 1 else 'Single-GPU'} Benchmark ---")
+        print(f"World Size: {world_size}")
+        print(f"Local Tokens: {local_total_tokens_list}")
+        print("-" * 100)
+        print("| Type         | Mode           | CP   | Local Tokens | Time(s)    | TFLOPs     | Mem(MB)  | Std(s)  |")
+        print("|-------------|----------------|------|--------------|------------|------------|----------|----------|")
 
-    for local_total_token in local_total_tokens:
-        benchmark_attention("magi", local_total_token, batch_size, num_heads, num_kv_heads, head_dim, num_iter, forward_only, cp_groups)
-        benchmark_attention("zigzag", local_total_token, batch_size, num_heads, num_kv_heads, head_dim, num_iter, forward_only, cp_groups)
+    try:
+        for local_total_tokens in local_total_tokens_list:
+            for attn_type in ["magi", "zigzag_flex", "zigzag_ring"]:
+                benchmark_attention(
+                    attn_type, local_total_tokens, batch_size,
+                    num_heads, num_kv_heads, head_dim,
+                    num_iter, forward_only, cp_groups
+                )
+                if rank == 0:
+                    print("|-------------|----------------|------|--------------|------------|------------|----------|----------|")
 
-    if rank == 0:
-        print("-------------------------------------------------------------------------------------")
+        if rank == 0:
+            print(f"\nBenchmark Completed at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    finally:
+        # 清理分布式环境
+        dist.destroy_process_group()
 
-    dist.destroy_process_group()
+if __name__ == "__main__":
+    main()

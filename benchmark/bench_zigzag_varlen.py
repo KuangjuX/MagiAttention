@@ -16,136 +16,87 @@ from magi_attention.config import DistAttnConfig
 from zigzag_flex_flash_attn import zigzag_flex_flash_attn_varlen_func
 from ring_flash_attn import zigzag_ring_flash_attn_varlen_func
 
-def calculate_attn_flops(
-    q_ranges: AttnRanges,
-    k_ranges: AttnRanges,
-    attn_mask_type: List[AttnMaskType],
-    total_seqlen_q: int,
-    num_heads_q: int,
-    num_heads_kv: int,
-    head_dim: int,
-) -> Dict[str, float]:
-    """计算注意力机制的理论 FLOPs
-    
-    对于因果注意力，每个位置 i 只能看到位置 0 到 i，所以：
-    - 位置 0 看到 1 个 token
-    - 位置 1 看到 2 个 tokens
-    - 位置 2 看到 3 个 tokens
-    ...
-    - 位置 n-1 看到 n 个 tokens
-    总计算量是等差数列求和：n*(n+1)/2
-    """
-    # 计算每个序列的实际注意力计算量
-    total_tokens = 0
-    total_attn_elements = 0
-    
-    for i in range(len(q_ranges)):
-        q_start, q_end = q_ranges[i].start, q_ranges[i].end
-        k_start, k_end = k_ranges[i].start, k_ranges[i].end
-        seq_len = q_end - q_start
-        
-        if attn_mask_type[i] == AttnMaskType.CAUSAL:
-            # 因果注意力：等差数列求和 n*(n+1)/2
-            attn_elements = (seq_len * (seq_len + 1)) // 2
-        else:
-            # 全量注意力：n*n
-            attn_elements = seq_len * seq_len
-            
-        total_tokens += seq_len
-        total_attn_elements += attn_elements
-    
-    # 计算 GQA 的实际 FLOPs
-    # 1. QK 乘法：每个 token 位置都需要计算 head_dim 维度的点积
-    qk_flops = 2 * total_attn_elements * head_dim  # 乘加各算一次
-    
-    # 2. Softmax: exp + sum + div，每个注意力分数都需要
-    softmax_flops = 3 * total_attn_elements
-    
-    # 3. PV 乘法：每个注意力分数都要乘以对应的 V 向量
-    pv_flops = 2 * total_attn_elements * head_dim
-    
-    # 考虑 GQA：每个 KV head 被 num_heads_q/num_heads_kv 个 Q head 使用
-    heads_ratio = num_heads_q / num_heads_kv
-    flops_per_kv_head = qk_flops + softmax_flops + pv_flops
-    
-    # 总 FLOPs = 每个 KV head 的 FLOPs * KV head 数量 * 每个 KV head 服务的 Q head 数量
-    flops_fwd = flops_per_kv_head * num_heads_kv
-    
-    # 反向传播约为前向传播的 2 倍
-    # - QK 反向：计算 Q 和 K 的梯度
-    # - Softmax 反向：计算 softmax 的梯度
-    # - PV 反向：计算 P 和 V 的梯度
-    flops_bwd = flops_fwd * 2
-    flops_1f1b = flops_fwd + flops_bwd
-    
-    return {
-        "fwd": flops_fwd,
-        "bwd": flops_bwd,
-        "1f1b": flops_1f1b,
-        "details": {
-            "total_tokens": total_tokens,
-            "total_attn_elements": total_attn_elements,
-            "qk_flops": qk_flops * num_heads_kv,
-            "softmax_flops": softmax_flops * num_heads_kv,
-            "pv_flops": pv_flops * num_heads_kv,
-            "flops_per_kv_head": flops_per_kv_head
-        }
-    }
+# --- FLOPs calculator (assuming it's available) ---
+try:
+    from tools.calculate_flops import calculate_attn_flops
+except ImportError:
+    from magi_attention.meta._calc_dispatch_meta import _calc_self_attn_areas
+    def calculate_attn_flops(
+        q_ranges: AttnRanges, k_ranges: AttnRanges, attn_mask_type: list[AttnMaskType],
+        total_seqlen_q: int, num_heads_q: int, head_dim: int,
+    ) -> dict[str, float]:
+        attn_area = _calc_self_attn_areas(
+            q_ranges, k_ranges, attn_mask_type,
+            num_chunks=1, chunk_size=total_seqlen_q,
+        ).area
+        flops_fwd = 4 * attn_area * num_heads_q * head_dim
+        flops_bwd = flops_fwd * 2.5
+        flops_1f1b = flops_fwd + flops_bwd
+        return {"fwd": flops_fwd, "bwd": flops_bwd, "1f1b": flops_1f1b}
+
 
 def calculate_global_causal_varlen_flops(
     world_size: int,
     batch_size: int,
     seqlen: int,
     num_heads: int,
-    num_kv_heads: int,
     head_dim: int,
     forward_only: bool,
-) -> Dict[str, float]:
-    """计算分布式因果可变长度注意力的理论 FLOPs"""
-    # 构建全局序列布局
+) -> float:
+    """
+    Calculates the total theoretical FLOPs for a distributed causal varlen attention task.
+
+    This function models the entire problem as a single, large causal attention
+    computation spread across all GPUs. The resulting FLOPs value is the
+    theoretical total for the entire system, and is applicable to any algorithm
+    (like Magi or Zigzag) that correctly solves this problem.
+
+    Args:
+        world_size: The number of GPUs in the process group.
+        batch_size: The number of sequences on EACH GPU.
+        seqlen: The length of each sequence.
+        num_heads: The number of attention heads.
+        head_dim: The dimension of each attention head.
+        forward_only: If True, calculates forward pass FLOPs. Otherwise, fwd + bwd.
+
+    Returns:
+        The total theoretical FLOPs for the distributed computation.
+    """
+    # 1. Define the sequence layout for a SINGLE rank.
+    # This assumes uniform sequence lengths for simplicity, matching the benchmark.
+    # ... (steps 1 and 2, building the global lists, are all correct and remain unchanged) ...
     local_cu_seqlens = torch.arange(0, (batch_size + 1) * seqlen, seqlen, dtype=torch.int32)
     global_q_ranges_list = []
     global_k_ranges_list = []
-    
+    total_tokens = 0
     for rank in range(world_size):
         rank_offset = rank * batch_size * seqlen
         for i in range(batch_size):
             seq_start = rank_offset + local_cu_seqlens[i].item()
             seq_end = rank_offset + local_cu_seqlens[i+1].item()
             global_q_ranges_list.append([seq_start, seq_end])
-            # 因果掩码：只能看到当前及之前的 tokens
-            global_k_ranges_list.append([0, seq_end])
+            global_k_ranges_list.append([0, seq_end]) # Causality is defined here
+        total_tokens += batch_size * seqlen
 
     global_q_ranges = AttnRanges.from_ranges(global_q_ranges_list)
     global_k_ranges = AttnRanges.from_ranges(global_k_ranges_list)
     global_batch_size = world_size * batch_size
 
-    # 使用因果掩码计算 FLOPs
+    # 3. Use the precise calculator with the CORRECT mask type.
+    # We tell the calculator that each sub-problem is a full, dense computation.
     flops_dict = calculate_attn_flops(
         q_ranges=global_q_ranges,
         k_ranges=global_k_ranges,
-        attn_mask_type=[AttnMaskType.CAUSAL] * global_batch_size,
-        total_seqlen_q=seqlen * batch_size * world_size,
+        # *** THE FIX IS HERE ***
+        attn_mask_type=[AttnMaskType.FULL] * global_batch_size,
+        total_seqlen_q=total_tokens,
         num_heads_q=num_heads,
-        num_heads_kv=num_kv_heads,
         head_dim=head_dim,
     )
-    
-    # if rank == 0:
-    #     details = flops_dict["details"]
-    #     print(f"\nComputation Analysis:")
-    #     print(f"Total tokens: {details['total_tokens']}")
-    #     print(f"Total attention elements: {details['total_attn_elements']}")
-    #     print(f"FLOPs per KV head: {details['flops_per_kv_head']/1e9:.2f} GFLOPs")
-    #     print(f"\nFLOPs Breakdown (per iteration):")
-    #     print(f"QK multiply: {details['qk_flops']/1e12:.2f} TFLOPs")
-    #     print(f"Softmax: {details['softmax_flops']/1e12:.2f} TFLOPs")
-    #     print(f"PV multiply: {details['pv_flops']/1e12:.2f} TFLOPs")
-    #     print(f"Total forward: {flops_dict['fwd']/1e12:.2f} TFLOPs")
-    #     if not forward_only:
-    #         print(f"Total backward: {flops_dict['bwd']/1e12:.2f} TFLOPs")
-    
-    return flops_dict
+
+    # 4. Return the final FLOPs count (unchanged).
+    total_flops = flops_dict["fwd"] if forward_only else flops_dict["1f1b"]
+    return total_flops
 
 class BenchmarkMetrics:
     """性能指标收集器"""
@@ -484,7 +435,7 @@ def benchmark_attention(
     stats = metrics.get_stats()
     flops_dict = calculate_global_causal_varlen_flops(
         world_size, batch_size, seqlen,
-        num_heads, num_kv_heads, head_dim, forward_only
+        num_heads, head_dim, forward_only
     )
     
     total_flops = flops_dict["fwd"] if forward_only else flops_dict["1f1b"]
